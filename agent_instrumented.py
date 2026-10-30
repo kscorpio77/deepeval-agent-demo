@@ -3,25 +3,15 @@ agent_instrumented.py
 =====================
 SAME agent as agent_plain.py, with DeepEval observability added.
 
-What changed vs agent_plain.py? Only 4 things — all marked with "NEW":
-
-  (1) Import CallbackHandler from deepeval.integrations.langchain
-  (2) Build the callback handler once (no metrics baked in — metrics are
-      attached by the test file at run time)
-  (3) Pass it via config={"callbacks": [...]} on .invoke()
-  (4) (Optional) Add @observe on the outer Python wrapper so any
-      non-LangChain code we add later (guardrails, post-processing)
-      also shows up as spans
-
-That's it. Four lines, and now QA can run component-level evals
-without ever touching this file again.
+Minimal changes from the original:
+1. Remove nest_asyncio.apply() (it interfered with AnyIO/MCP).
+2. Use sys.executable for the MCP subprocess.
+3. Add @observe() so update_current_trace() runs in an active trace.
 """
 
 import asyncio
 import os
-
-import nest_asyncio
-nest_asyncio.apply()
+import sys
 
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
@@ -31,17 +21,17 @@ load_dotenv()
 from langchain_core.tools import tool
 from langchain.agents import create_agent
 
-# --- (1) NEW: import DeepEval tracing primitives --------------------------
+# --- DeepEval tracing primitives ------------------------------------------
 from deepeval.integrations.langchain import CallbackHandler
+from deepeval.tracing import observe
 from deepeval.tracing.context import update_current_trace
-
 
 # ---------------------------------------------------------------------------
 # Same fake data as agent_plain.py.
 # ---------------------------------------------------------------------------
 ORDERS = {
-    "ORD-1042": {"status": "Shipped",    "eta": "2026-05-13", "category": "Electronics"},
-    "ORD-2099": {"status": "Delivered",  "eta": "2026-05-08", "category": "clothing"},
+    "ORD-1042": {"status": "Shipped", "eta": "2026-05-13", "category": "Electronics"},
+    "ORD-2099": {"status": "Delivered", "eta": "2026-05-08", "category": "clothing"},
     "ORD-7777": {"status": "Processing", "eta": "2026-05-15", "category": "food"},
 }
 
@@ -82,7 +72,7 @@ llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
 _mcp_tools = asyncio.run(
     MultiServerMCPClient({
         "shopease": {
-            "command": "python",
+            "command": sys.executable,  # CHANGED: same interpreter as this script
             "args": [os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")],
             "transport": "stdio",
         }
@@ -107,9 +97,9 @@ agent = create_agent(
 deepeval_callback = CallbackHandler()
 
 
+@observe()  # ADDED: ensures update_current_trace has an active trace
 def support_agent(user_input: str) -> str:
     """Run the agent on a user message and return the final reply."""
-    # --- (3) NEW: pass the callback handler in the .invoke() config ------
     result = asyncio.run(agent.ainvoke(
         {"messages": [{"role": "user", "content": user_input}]},
         config={"callbacks": [deepeval_callback]},
